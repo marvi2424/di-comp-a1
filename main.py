@@ -31,8 +31,16 @@ class mrjob_ass1(MRJob):
             # k/v out : word       -> (category, count)
             #           '__TOTAL__' -> (category, cat_total)
             MRStep(mapper=self.mapper_2,
-                   reducer=self.reducer_2),
-            # TODO add Step 3 for top-75 selection and output formatting
+                   reducer_init=self.reducer_2_init,
+                   reducer=self.reducer_2,
+                   jobconf={'mapreduce.job.reduces': '1'}),
+
+            # Step 3: Chi-square computation, top-75 selection per category,
+            # merged dictionary. '~DICT~' sentinel sorts last (tilde ASCII 126
+            # > all uppercase category letters) so the merged line appears last.
+            MRStep(mapper=self.mapper_3,
+                   combiner=self.combiner_3,
+                   reducer=self.reducer_3),
         ]
 
 
@@ -142,27 +150,156 @@ class mrjob_ass1(MRJob):
             yield word, (cat, count)
 
 
-    # TODO implement reducer_2
-    # Expected inputs:
-    #   key='__TOTAL__' : values = [(category, cat_total), ...]
-    #                     -> compute N = sum(cat_totals)
-    #                     -> emit (category) -> (cat_total, N)
-    #   key=word        : values = [(category, A), ...]
-    #                     -> compute token_total = sum(A)
-    #                     -> emit (category, word) -> (A, token_total, cat_total, N)
-    #
-    # Expected outputs (needed by Step 3 to compute chi-square):
-    #   (category, word) -> (A, token_total, cat_total, N)
+    # reducer_2 relies on '__TOTAL__' being processed before any word key.
+    # With a single reducer (--jobconf mapreduce.job.reduces=1 on Hadoop;
+    # local mode is inherently single-reducer), mrjob sorts JSON-encoded
+    # keys and '"__TOTAL__"' sorts before any lowercase word, so cat_totals
+    # and N are fully populated when word keys arrive.
+
+    def reducer_2_init(self):
+        """
+        Initialises shared state used across all reducer_2 calls.
+        cat_totals is populated when key=='__TOTAL__' (always processed
+        first due to sort order + single-reducer constraint), so the
+        values are available by the time word keys arrive.
+
+        k/v in  : none
+        k/v out : none (initialises self.cat_totals and self.N)
+        """
+        self.cat_totals = {}   # {category: total_doc_count_in_category}
+        self.N = 0             # grand total documents across all categories
 
     def reducer_2(self, key, values):
-        # TEMPORARY!! Remove once real reducer is implemented.
-        # Just forwards all values so we can inspect mapper_2 output
-        for v in values:
-            yield key, v
+        """
+        Handles two record types, sorted by key:
+
+        1. key == '__TOTAL__' arrives first. Populates self.cat_totals
+           from each (category, cat_total) pair and accumulates N.
+           Emits nothing, just builds state.
+
+        2. key == word (any token string). Computes
+           token_total = sum(A across all categories), then emits one
+           record per (category, A) with all four values needed for
+           chi-square in Step 3.
+
+        k/v in  : '__TOTAL__' -> (category, cat_total)
+                  word        -> (category, A)
+        k/v out : (category, word) -> [A, token_total, cat_total, N]
+                  (nothing emitted for '__TOTAL__' key)
+        """
+        if key == '__TOTAL__':
+            for cat, cat_total in values:
+                self.cat_totals[cat] = cat_total
+                self.N += cat_total
+        else:
+            word = key
+            word_data = list(values)
+            token_total = sum(A for _, A in word_data)
+            for cat, A in word_data:
+                cat_total = self.cat_totals.get(cat, 0)
+                if cat_total > 0 and self.N > 0:
+                    yield (cat, word), [A, token_total, cat_total, self.N]
 
 
 
-    # TODO implement Step 3 (chi-square formula, top-75 per category, output formatting)
+    # =========================================================================
+    # STEP 3 - Chi-square, top-75 per category, merged dictionary
+    # =========================================================================
+
+    def mapper_3(self, key, value):
+        """
+        Computes chi-square for each (category, word) pair using the
+        contingency table values emitted by reducer_2. Rekeys by
+        category so reducer_3 can collect all (chi2, word) pairs per
+        category and pick the top 75. Also emits every word under the
+        '~DICT~' sentinel key so reducer_3 can build the merged
+        dictionary line (tilde sorts after all uppercase category
+        names, so the merged line lands last).
+
+        Skips emission when the chi-square denominator is 0, which
+        happens only in degenerate cases (e.g. a token appears in
+        every document or a category has zero documents).
+
+        k/v in  : (category, word) -> [A, token_total, cat_total, N]
+        k/v out : category  -> (chi2, word)   for top-75 selection
+                  '~DICT~'  -> word           for merged dictionary
+        """
+        cat, word = key
+        A, token_total, cat_total, N = value
+
+        B = cat_total - A
+        C = token_total - A
+        D = N - cat_total - token_total + A
+
+        denom = token_total * (N - token_total) * cat_total * (N - cat_total)
+        if denom == 0:
+            return
+
+        chi2 = N * (A * D - B * C) ** 2 / denom
+
+        yield cat, (chi2, word)
+        yield '~DICT~', word
+
+
+    def combiner_3(self, key, values):
+        """
+        Reduces shuffle volume between mapper_3 and reducer_3.
+
+        For category keys, keeps only the local top-75 by chi2, since
+        any (chi2, word) outside the local top-75 cannot be in the
+        global top-75 for that category.
+
+        For the '~DICT~' key, deduplicates words locally so each
+        unique word travels to the reducer at most once per mapper
+        task.
+
+        Yields the same k/v shape as mapper_3: individual tuples for
+        category keys, individual words for '~DICT~'.
+
+        k/v in  : category  -> (chi2, word)
+                  '~DICT~'  -> word
+        k/v out : category  -> (chi2, word)   local top-75 per mapper
+                  '~DICT~'  -> word           deduplicated per mapper
+        """
+        if key == '~DICT~':
+            seen = set()
+            for word in values:
+                if word not in seen:
+                    seen.add(word)
+                    yield key, word
+        else:
+            top = sorted(values, key=lambda x: -x[0])[:75]
+            for item in top:
+                yield key, item
+
+
+    def reducer_3(self, key, values):
+        """
+        Builds the final output lines.
+
+        For category keys, sorts the incoming (chi2, word) pairs by
+        chi2 descending, keeps the top 75, and formats the line as
+        "Category word1:chi2 word2:chi2 ..." with chi2 rendered
+        using :.10g (up to 10 significant digits, no trailing zeros,
+        no scientific notation for typical magnitudes).
+
+        For '~DICT~' (arrives last, tilde > uppercase ASCII),
+        deduplicates, sorts alphabetically, and joins with spaces to
+        produce the merged dictionary line.
+
+        k/v in  : category -> [(chi2, word), ...]
+                  '~DICT~' -> [word, ...]
+        k/v out : category -> "Category word1:chi2 word2:chi2 ..."
+                  '~DICT~' -> "word1 word2 ..." (alphabetical)
+        """
+        if key == '~DICT~':
+            all_words = sorted(set(values))
+            yield key, ' '.join(all_words)
+        else:
+            cat = key
+            top_75 = sorted(values, key=lambda x: -x[0])[:75]
+            parts = [f'{word}:{chi2:.10g}' for chi2, word in top_75]
+            yield cat, f'{cat} {" ".join(parts)}'
 
 
 # This is the main entry point for the script when run from the command line
