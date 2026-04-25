@@ -1,7 +1,13 @@
 #imports
 from mrjob.job import MRJob, MRStep #for MapReduce jobs
 from mrjob.protocol import RawValueProtocol #raw bytes output for the final step (no JSON, no key)
-import ujson #for more efficient JSON parsing
+# Prefer ujson (C-accelerated) for speed; fall back to stdlib json if the
+# cluster image doesn't have ujson installed. Both expose .loads with the
+# same signature for our usage.
+try:
+    import ujson as json_lib
+except ImportError:
+    import json as json_lib
 import re #for tokenization
 import heapq #for bounded top-k selection
 
@@ -94,17 +100,24 @@ class mrjob_ass1(MRJob):
 
 
     def mapper_1(self, _, line):
-        data = ujson.loads(line) #parse the JSON line
+        data = json_lib.loads(line) #parse the JSON line
         category = data.get('category') #get the category of the review
         review_text = data.get('reviewText', '') #get the review text, default to empty string if not present
 
         #convert to lowercase
         review_text = review_text.lower()
 
-        #tokenize the review text using the defined splitting regex
+        # Tokenize and DEDUPLICATE within the document. Chi-square A is
+        # document frequency (# of docs in category c that contain token t),
+        # not term frequency. Emitting per occurrence would inflate A and
+        # break the contingency table (A could exceed cat_total).
+        seen = set()
         for word in self.splitting_on.split(review_text):
             if word and word not in self.stopwords and len(word) > 1:
-                yield (category, word), 1 #emit (category, word) as key and 1 as value for counting
+                seen.add(word)
+
+        for word in seen:
+            yield (category, word), 1
 
         # Emit one document count per category so reducer_2 can compute
         # cat_total (= A+C in the chi-square contingency table) and grand total N.
