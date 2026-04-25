@@ -1,11 +1,20 @@
 #imports
 from mrjob.job import MRJob, MRStep #for MapReduce jobs
+from mrjob.protocol import RawValueProtocol #raw bytes output for the final step (no JSON, no key)
 import ujson #for more efficient JSON parsing
 import re #for tokenization
+import heapq #for bounded top-k selection
 
 
 
 class mrjob_ass1(MRJob):
+
+    # Final-step output protocol: write only the value, as raw bytes,
+    # with no key and no JSON encoding. This makes the mrjob output
+    # itself match the assignment's required output.txt format, so no
+    # post-processing script is needed. Inter-step serialization is
+    # unaffected (still uses the default JSON internal protocol).
+    OUTPUT_PROTOCOL = RawValueProtocol
 
     #for local testing purposes we need to give mrjob permission to use/upload files like stopwords.txt
     def configure_args(self):
@@ -36,11 +45,30 @@ class mrjob_ass1(MRJob):
                    jobconf={'mapreduce.job.reduces': '1'}),
 
             # Step 3: Chi-square computation, top-75 selection per category,
-            # merged dictionary. '~DICT~' sentinel sorts last (tilde ASCII 126
-            # > all uppercase category letters) so the merged line appears last.
+            # merged dictionary. The merged dictionary is built reducer-side
+            # from the selected top-75 words per category (per the assignment's
+            # "merge the lists" requirement) and emitted from reducer_final
+            # under the '~DICT~' sentinel key. With multiple reducer tasks
+            # each emits its own partial dictionary, which Step 4 unions
+            # into a single line.
             MRStep(mapper=self.mapper_3,
                    combiner=self.combiner_3,
-                   reducer=self.reducer_3),
+                   reducer_init=self.reducer_3_init,
+                   reducer=self.reducer_3,
+                   reducer_final=self.reducer_3_final),
+
+            # Step 4: Final output assembly. Funnels every Step 3 record
+            # under one sentinel key so a single reducer call sees all
+            # category lines plus all '~DICT~' partials and can emit a
+            # globally sorted, deduplicated final output. Combined with
+            # OUTPUT_PROTOCOL = RawValueProtocol, this writes plain
+            # output.txt-format lines directly (no JSON, no tabs, no
+            # post-processing script needed). The data volume here is
+            # tiny (~22 category lines plus a small number of partial
+            # dict strings) so the single-reducer funnel is essentially
+            # free.
+            MRStep(mapper=self.mapper_4,
+                   reducer=self.reducer_4),
         ]
 
 
@@ -206,23 +234,34 @@ class mrjob_ass1(MRJob):
     # STEP 3 - Chi-square, top-75 per category, merged dictionary
     # =========================================================================
 
+    def _top_75(self, values):
+        """
+        Returns the best 75 (chi2, word) pairs without materialising and
+        sorting all values. Ordering matches sorted(values,
+        key=lambda x: (-x[0], x[1]))[:75].
+        """
+        return heapq.nsmallest(75, values, key=lambda x: (-x[0], x[1]))
+
     def mapper_3(self, key, value):
         """
         Computes chi-square for each (category, word) pair using the
         contingency table values emitted by reducer_2. Rekeys by
         category so reducer_3 can collect all (chi2, word) pairs per
-        category and pick the top 75. Also emits every word under the
-        '~DICT~' sentinel key so reducer_3 can build the merged
-        dictionary line (tilde sorts after all uppercase category
-        names, so the merged line lands last).
+        category and pick the top 75.
 
         Skips emission when the chi-square denominator is 0, which
         happens only in degenerate cases (e.g. a token appears in
         every document or a category has zero documents).
 
+        The merged dictionary is NOT emitted from this mapper. It is
+        built reducer-side from the selected top-75 words per
+        category and emitted in reducer_3_final, so the dictionary
+        contains exactly the union of the top-75 lists (per the
+        assignment's "merge the lists" requirement) rather than the
+        full post-stopword vocabulary.
+
         k/v in  : (category, word) -> [A, token_total, cat_total, N]
-        k/v out : category  -> (chi2, word)   for top-75 selection
-                  '~DICT~'  -> word           for merged dictionary
+        k/v out : category -> (chi2, word)   for top-75 selection
         """
         cat, word = key
         A, token_total, cat_total, N = value
@@ -238,68 +277,132 @@ class mrjob_ass1(MRJob):
         chi2 = N * (A * D - B * C) ** 2 / denom
 
         yield cat, (chi2, word)
-        yield '~DICT~', word
 
 
     def combiner_3(self, key, values):
         """
-        Reduces shuffle volume between mapper_3 and reducer_3.
+        Reduces shuffle volume between mapper_3 and reducer_3 by
+        keeping only the local top-75 by chi2 per category. Any
+        (chi2, word) outside the local top-75 for a mapper task
+        cannot be in the global top-75 for that category, so it is
+        safe to drop here.
 
-        For category keys, keeps only the local top-75 by chi2, since
-        any (chi2, word) outside the local top-75 cannot be in the
-        global top-75 for that category.
+        Sort key (-chi2, word) breaks chi2 ties alphabetically so
+        the selection is deterministic across runs even when the
+        shuffle order varies.
 
-        For the '~DICT~' key, deduplicates words locally so each
-        unique word travels to the reducer at most once per mapper
-        task.
-
-        Yields the same k/v shape as mapper_3: individual tuples for
-        category keys, individual words for '~DICT~'.
-
-        k/v in  : category  -> (chi2, word)
-                  '~DICT~'  -> word
-        k/v out : category  -> (chi2, word)   local top-75 per mapper
-                  '~DICT~'  -> word           deduplicated per mapper
+        k/v in  : category -> (chi2, word)
+        k/v out : category -> (chi2, word)   local top-75 per mapper
         """
-        if key == '~DICT~':
-            seen = set()
-            for word in values:
-                if word not in seen:
-                    seen.add(word)
-                    yield key, word
-        else:
-            top = sorted(values, key=lambda x: -x[0])[:75]
-            for item in top:
-                yield key, item
+        top = self._top_75(values)
+        for item in top:
+            yield key, item
+
+
+    def reducer_3_init(self):
+        """
+        Initialises the set used to build the merged dictionary
+        line. Populated as each category is processed in reducer_3
+        and emitted once in reducer_3_final.
+
+        k/v in  : none
+        k/v out : none (initialises self.dict_words)
+        """
+        self.dict_words = set()
 
 
     def reducer_3(self, key, values):
         """
-        Builds the final output lines.
+        Selects the top-75 (chi2, word) pairs by chi2 descending for
+        the category, accumulates the selected words into
+        self.dict_words for the final merged dictionary line, and
+        emits the formatted category line.
 
-        For category keys, sorts the incoming (chi2, word) pairs by
-        chi2 descending, keeps the top 75, and formats the line as
-        "Category word1:chi2 word2:chi2 ..." with chi2 rendered
-        using :.10g (up to 10 significant digits, no trailing zeros,
-        no scientific notation for typical magnitudes).
+        Sort key (-chi2, word) breaks chi2 ties alphabetically so
+        the global top-75 is reproducible across runs.
 
-        For '~DICT~' (arrives last, tilde > uppercase ASCII),
-        deduplicates, sorts alphabetically, and joins with spaces to
-        produce the merged dictionary line.
+        chi2 is rendered using :.10g (up to 10 significant digits,
+        no trailing zeros, no scientific notation for typical
+        magnitudes).
 
         k/v in  : category -> [(chi2, word), ...]
-                  '~DICT~' -> [word, ...]
         k/v out : category -> "Category word1:chi2 word2:chi2 ..."
-                  '~DICT~' -> "word1 word2 ..." (alphabetical)
         """
-        if key == '~DICT~':
-            all_words = sorted(set(values))
-            yield key, ' '.join(all_words)
-        else:
-            cat = key
-            top_75 = sorted(values, key=lambda x: -x[0])[:75]
-            parts = [f'{word}:{chi2:.10g}' for chi2, word in top_75]
-            yield cat, f'{cat} {" ".join(parts)}'
+        cat = key
+        top_75 = self._top_75(values)
+        self.dict_words.update(word for _, word in top_75)
+        parts = [f'{word}:{chi2:.10g}' for chi2, word in top_75]
+        yield cat, f'{cat} {" ".join(parts)}'
+
+
+    def reducer_3_final(self):
+        """
+        Emits this reducer task's partial merged dictionary once
+        after all of its category keys have been processed. With
+        multiple Step 3 reducer tasks each task contributes its own
+        partial; Step 4 unions them into the final dictionary line.
+
+        Uses the '~DICT~' sentinel key.
+
+        k/v in  : none
+        k/v out : '~DICT~' -> "word1 word2 ..." (partial, alphabetical)
+        """
+        yield '~DICT~', ' '.join(sorted(self.dict_words))
+
+
+    # =========================================================================
+    # STEP 4 - Final output assembly (single-reducer funnel + raw output)
+    # =========================================================================
+
+    def mapper_4(self, key, value):
+        """
+        Routes every Step 3 record under one sentinel key so all of
+        them land in a single reducer call in Step 4. With only one
+        unique map-output key, the partitioner sends all records to
+        a single reducer regardless of how many reducer tasks the
+        runner launches; the other reducer tasks receive no keys
+        and produce no output.
+
+        Step 3 emits at most ~22 category records plus one '~DICT~'
+        record per Step 3 reducer task, so the funnel volume is
+        trivial.
+
+        k/v in  : category -> "Category word1:chi2 ..."
+                  '~DICT~' -> "word1 word2 ..." (partial dict)
+        k/v out : '__OUT__' -> (original_key, original_value)
+        """
+        yield '__OUT__', (key, value)
+
+
+    def reducer_4(self, key, values):
+        """
+        Receives every record from Step 3 in a single call. Emits
+        category lines in alphabetical order followed by the merged
+        dictionary line built from the union of all '~DICT~'
+        partials.
+
+        Uses OUTPUT_PROTOCOL = RawValueProtocol, so each yielded
+        value is written as raw bytes (one line per yield) with no
+        key and no JSON encoding. This produces the exact
+        output.txt format required by the assignment without any
+        post-processing.
+
+        k/v in  : '__OUT__' -> [(orig_key, orig_value), ...]
+        k/v out : None -> "Category word1:chi2 ..."   (per category)
+                  None -> "word1 word2 ..."           (merged dict)
+        """
+        category_lines = []
+        dict_words = set()
+        for orig_key, orig_value in values:
+            if orig_key == '~DICT~':
+                dict_words.update(orig_value.split())
+            else:
+                category_lines.append((orig_key, orig_value))
+
+        category_lines.sort(key=lambda kv: kv[0])
+        for _, line in category_lines:
+            yield None, line
+        yield None, ' '.join(sorted(dict_words))
 
 
 # This is the main entry point for the script when run from the command line
