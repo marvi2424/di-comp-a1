@@ -34,8 +34,9 @@
 }
 
 \title{Top-75 Discriminative Terms per Amazon Review Category\\via MapReduce on Hadoop}
-\author{Group X --- Data-Intensive Computing (194.048), TU Wien\\
-        \small Member 1, Member 2, Member 3, Member 4, Member 5}
+\author{Group 36 --- Data-Intensive Computing (194.048), TU Wien\\
+        \small Schmidt Felix Rudolf, Trapuzzano Gianluca, Vani Marvi,
+        Trumshi Fiona, Emon Md.~Emamul Hasan}
 \date{April 28, 2026}
 
 \begin{document}
@@ -50,7 +51,7 @@ review corpora.  In this assignment we apply the chi-square ($\chi^{2}$) test
 of independence to the Amazon Reviews dataset to extract, for each of the
 22~product categories, the 75 unigram terms most strongly associated with
 that category.  The full corpus comprises about 78.8 million review records
-distributed across an HDFS file of approximately 58~GB, which makes the
+distributed across an HDFS file of approximately 56~GB, which makes the
 problem genuinely data-intensive and motivates a MapReduce solution.
 
 The pipeline is implemented with the \texttt{mrjob} Python framework and
@@ -120,32 +121,33 @@ deduplicates tokens within each document before emission
 
 \subsection*{Dataset characteristics (from cluster counters)}
 
-The full run reports $N=78\,828\,876$ reviews and 22 categories. After
-preprocessing, the post-stopword vocabulary is approximately $6.2$~million
-distinct words; the number of distinct $(c,t)$ pairs to be scored is
-$12{,}189{,}683$.  The fact that the vocabulary grows sublinearly with
-collection size (Heaps' law) is what makes a single-reducer pass over the
-post-aggregated stream tractable at this scale; we return to this point in
-the discussion.
+The full run reports $N = 78{,}828{,}876$ reviews distributed over 22
+categories. After preprocessing, the post-stopword vocabulary contains
+roughly $6.2$~million distinct unigrams; the number of distinct $(c,t)$
+pairs to be scored is approximately $12.19$~million. The fact that the
+vocabulary grows sublinearly with collection size (Heaps' law) is what
+makes a single-reducer pass over the post-aggregated stream tractable at
+this scale; we return to this point in the discussion.
 
 \section{Methodology}
 
 \subsection{Pipeline overview}
 
-Figure~\ref{fig:pipeline} shows the conceptual pipeline.  The implementation
-realises it as four \texttt{MRStep}s linked by \texttt{mrjob}.  Phase~3
-of the figure corresponds to two physical MRSteps in the code: one to
-gather token totals across categories (MRStep~2) and one to compute and
-rank $\chi^{2}$ scores (MRStep~3); Phase~4 of the figure corresponds to
-MRStep~4 (final assembly).  All four steps run on the same cluster
-job submission and share \texttt{mrjob}'s temporary HDFS directory.
+Figure~\ref{fig:pipeline} shows the conceptual pipeline.  The
+implementation realises it as four \texttt{MRStep}s, which \texttt{mrjob}
+submits as a chained sequence of four Hadoop streaming jobs sharing one
+temporary HDFS directory for the intermediate outputs.  Phase~3 of the
+figure corresponds to two physical MRSteps in the code: one to aggregate
+token totals across categories (MRStep~2) and one to compute and rank
+$\chi^{2}$ scores (MRStep~3); Phase~4 of the figure corresponds to
+MRStep~4 (final assembly).
 
 \begin{figure}[h]
   \centering
   \includegraphics[width=\textwidth,keepaspectratio]{Processing Pipeline Draft.pdf}
   \caption{Conceptual pipeline.  Phase~0 loads stopwords once per mapper
   task (\texttt{mapper\_init}). Phase~1 does the heavy lifting on the raw
-  58~GB input. Phase~2 is \texttt{mrjob}'s internal shuffle.  Phase~3
+  56~GB input. Phase~2 is \texttt{mrjob}'s internal shuffle.  Phase~3
   computes the contingency-table aggregates, evaluates~$\chi^{2}$, and
   selects the top~75 per category. Phase~4 emits the 22~category lines and
   the merged dictionary in the required \texttt{output.txt} format.}
@@ -187,9 +189,11 @@ are shuffled to the reducer. On the full run the combiner reduces
 that is essential to keep the shuffle volume manageable
 (Table~\ref{tab:counters}).
 
-\textbf{Reducer.}  A single reducer sums counts globally. Its output is
-$12.19$~million $((c,w)\!\to\!\textit{count})$ records and 22
-$((c,\texttt{\_\_TOTAL\_\_})\!\to\!\textit{cat\_total})$ records.
+\textbf{Reducer.}  A single reducer sums counts globally (we did not
+override the default reducer count for this step, since the heavy lifting
+is already absorbed by the combiner). Its output is $12.19$~million
+$((c,w)\!\to\!\textit{count})$ records together with 22 records of the form
+$((c,\texttt{\_\_TOTAL\_\_})\!\to\!\textit{cat\_total})$.
 
 \subsection{MRStep~2 --- Rekey and token-total computation}
 
@@ -215,15 +219,20 @@ which the token appears, carrying the four values needed for $\chi^{2}$:
 yield (cat, word), [A, token_total, cat_total, self.N]
 \end{lstlisting}
 
-This step is configured with \verb|jobconf={'mapreduce.job.reduces': '1'}|.
-The reason is that the \texttt{\_\_TOTAL\_\_} sentinel must be visible to
-every word reducer call, and the cleanest way to guarantee this in
-\texttt{mrjob} is to funnel every key through one task; the
-JSON-encoded key \texttt{"\_\_TOTAL\_\_"} sorts before any lower-case word,
-so the dictionary is fully populated by the time word records arrive. The
-trade-off is sequential reduce work; we discuss its actual cost in
-Section~\ref{sec:results} and a parallelisable alternative in
-Section~\ref{sec:conclusions}.
+This step is configured with \verb|jobconf={'mapreduce.job.reduces': '1'}|
+because the \texttt{\_\_TOTAL\_\_} aggregates have to be visible to
+\emph{every} word reducer call. With Hadoop's default hash partitioning,
+the single \texttt{\_\_TOTAL\_\_} key would otherwise be assigned to one
+specific reducer task only, leaving the other tasks (which receive
+disjoint subsets of the words) without the \textit{cat\_total} and $N$
+values they need to populate the contingency table.  Forcing a single
+reducer guarantees that every word and every \texttt{\_\_TOTAL\_\_}
+record arrive at the same task; the JSON-encoded key
+\texttt{"\_\_TOTAL\_\_"} sorts before any lower-case word, so the
+dictionary is fully populated by the time the first word record is
+processed. The trade-off is sequential reduce work; we quantify its
+actual cost in Section~\ref{sec:results} and discuss a parallelisable
+alternative in Section~\ref{sec:conclusions}.
 
 \subsection{MRStep~3 --- Chi-square, top-75, partial dictionary}
 
@@ -299,9 +308,12 @@ reducer).}
 respectively. The total accumulated map CPU time was about 23.6~hours,
 distributed across the cluster's available containers; the wall-clock map
 phase of MRStep~1 fitted within the run because YARN scheduled roughly two
-hundred concurrent map containers.
+hundred concurrent map containers. The reducer side is, by contrast,
+sequential: each step launched exactly one reducer task, so the
+$\sim$13~minutes of total reduce time (Table~\ref{tab:counters}) lies on
+the wall-clock critical path.
 
-\textbf{Data reduction.}  The 58~GB input is reduced to 395~MB after
+\textbf{Data reduction.}  The 56~GB input is reduced to 395~MB after
 MRStep~1, a 147$\times$ reduction driven by the combiner. By the end of
 MRStep~3 the relevant data is only 42~kB (Step~3 \texttt{Bytes Written});
 the final \texttt{output.txt} is 41.97~kB.
@@ -309,7 +321,7 @@ the final \texttt{output.txt} is 41.97~kB.
 \section{Conclusions}
 \label{sec:conclusions}
 
-The pipeline produces the required output and processes the full 58~GB
+The pipeline produces the required output and processes the full 56~GB
 corpus in under 20~minutes wall-clock time.  Three design choices
 contributed most to this result:
 
@@ -327,26 +339,40 @@ contributed most to this result:
       deterministic across multiple reducers.
 \end{enumerate}
 
-The principal limitation is the \emph{single-reducer constraint of
-MRStep~2}, which is forced by the \texttt{\_\_TOTAL\_\_} broadcast pattern.
-At our data scale this cost only $\sim$3~minutes (172~s reduce time) thanks
-to Heaps' law: the post-aggregation stream is bounded by the vocabulary
-size, not by the raw review count.  For substantially larger corpora the
-constraint would become the bottleneck, and a cleaner refactor is the
-\emph{distributed-cache / side-input pattern}: a tiny preceding job
-materialises the per-category totals into a small file, the main job loads
-it via \texttt{--upload-file} in \texttt{mapper\_init}, and the
-\texttt{\_\_TOTAL\_\_} plumbing disappears entirely. MRStep~2 then becomes
-embarrassingly parallel across an arbitrary number of reducers. We did not
-implement this refactor here because the current solution comfortably
-meets the runtime target.
+The principal limitation is that every step launched exactly one reducer
+task, putting the entire reduce phase on the sequential critical path
+(roughly 13~minutes out of 19~min~24~s wall-clock). Two distinct
+sub-issues are worth separating.
 
-A further point worth noting is that the actual wall-clock cost of the
-job is split roughly evenly between MRStep~1 (raw I/O and tokenisation
-on 58~GB) and the sequential reduce phases of MRSteps~1 and~2; subsequent
-steps are computationally trivial. This is consistent with the general
-observation that, at this scale, MapReduce jobs are dominated by the cost
-of the first heavy-aggregation pass, and that careful combiner design pays
-back on every byte of input.
+\textbf{(i) MRStep~2 is forced single-reducer} by the
+\texttt{\_\_TOTAL\_\_} broadcast pattern. At our scale this only cost
+$\sim$3~minutes thanks to Heaps' law: the post-aggregation stream is
+bounded by the vocabulary, not by the raw review count.  For
+substantially larger corpora the constraint would become a hard
+bottleneck, and the canonical refactor is the \emph{distributed-cache /
+side-input pattern}: a tiny preceding job materialises the per-category
+totals into a small file, the main job loads that file via
+\texttt{--upload-file} in \texttt{mapper\_init}, and the
+\texttt{\_\_TOTAL\_\_} plumbing disappears entirely. MRStep~2 then
+becomes embarrassingly parallel across an arbitrary number of reducers.
+
+\textbf{(ii) MRStep~1 used a single reducer by default.} Unlike MRStep~2
+this is not a correctness requirement --- summing $((c,w),\textit{count})$
+keys is associative and partitionable --- so the step could be split
+across $R$ reducers simply by setting \texttt{mapreduce.job.reduces}
+explicitly. With $R = 8$ the $\sim$10-minute reduce phase of MRStep~1
+would shrink to roughly 1.5~minutes, which alone would push the total
+run-time well below 10~minutes. We did not implement either refactor
+here because the current 19-minute run already comfortably meets the
+expected cluster runtime; the two are the natural next optimisations if
+the corpus were to grow by another order of magnitude.
+
+A complementary observation is that the actual wall-clock cost of the
+job is dominated by MRStep~1 --- raw I/O and tokenisation on 56~GB,
+followed by its single-reducer aggregation phase. Subsequent steps are
+computationally trivial. This is consistent with the general observation
+that, at this scale, MapReduce jobs are dominated by the cost of the
+first heavy-aggregation pass, and that careful combiner design pays back
+on every byte of input.
 
 \end{document}
