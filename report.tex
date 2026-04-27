@@ -2,7 +2,7 @@
 % Compile with: pdflatex report.tex  (run twice for cross-references)
 % Required: pdflatex, standard texlive packages.
 %
-% Figure: the report embeds "Processing Pipeline Draft.pdf" directly from
+% Figure: the report embeds "Processing_Pipeline.pdf" directly from
 % the project root. The grffile package handles the spaces in the filename.
 % =========================================================================
 \documentclass[11pt,a4paper]{article}
@@ -63,8 +63,7 @@ run on the full dataset that completed in 19~min~24~s of wall-clock time.
 
 \subsection*{Input and output}
 
-The input is a line-delimited JSON file in which every record contains at
-least a \texttt{category} field and a \texttt{reviewText} field. The required
+The input is a line-delimited JSON file in which every record contains among other features a \texttt{category} field and a \texttt{reviewText} field. The required
 output is a single text file with 23 lines:
 
 \begin{itemize}[leftmargin=*,nosep]
@@ -144,7 +143,7 @@ MRStep~4 (final assembly).
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=\textwidth,keepaspectratio]{Processing Pipeline Draft.pdf}
+  \includegraphics[width=\textwidth,keepaspectratio]{Processing_Pipeline.pdf}
   \caption{Conceptual pipeline.  Phase~0 loads stopwords once per mapper
   task (\texttt{mapper\_init}). Phase~1 does the heavy lifting on the raw
   56~GB input. Phase~2 is \texttt{mrjob}'s internal shuffle.  Phase~3
@@ -322,7 +321,7 @@ the final \texttt{output.txt} is 41.97~kB.
 \label{sec:conclusions}
 
 The pipeline produces the required output and processes the full 56~GB
-corpus in under 20~minutes wall-clock time.  Three design choices
+corpus in under 20~minutes wall-clock time, which was the desired outcome. Three design choices
 contributed most to this result:
 
 \begin{enumerate}[leftmargin=*,nosep]
@@ -367,12 +366,11 @@ here because the current 19-minute run already comfortably meets the
 expected cluster runtime; the two are the natural next optimisations if
 the corpus were to grow by another order of magnitude.
 
-A complementary observation is that the actual wall-clock cost of the
+One observation is that the actual wall-clock cost of the
 job is dominated by MRStep~1 --- raw I/O and tokenisation on 56~GB,
 followed by its single-reducer aggregation phase. Subsequent steps are
 computationally trivial. This is consistent with the general observation
 that, at this scale, MapReduce jobs are dominated by the cost of the
-first heavy-aggregation pass, and that careful combiner design pays back
-on every byte of input.
+first heavy-aggregation pass, and that careful combiner design pays off.
 
 \end{document}
